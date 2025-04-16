@@ -1,10 +1,17 @@
 #include "tasksys.h"
-
+#include <vector>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <unordered_map>
+#include <functional>
 
 IRunnable::~IRunnable() {}
 
 ITaskSystem::ITaskSystem(int num_threads) {}
 ITaskSystem::~ITaskSystem() {}
+
 
 /*
  * ================================================================
@@ -16,9 +23,7 @@ const char* TaskSystemSerial::name() {
     return "Serial";
 }
 
-TaskSystemSerial::TaskSystemSerial(int num_threads): ITaskSystem(num_threads) {
-}
-
+TaskSystemSerial::TaskSystemSerial(int num_threads) : ITaskSystem(num_threads) {}
 TaskSystemSerial::~TaskSystemSerial() {}
 
 void TaskSystemSerial::run(IRunnable* runnable, int num_total_tasks) {
@@ -32,7 +37,6 @@ TaskID TaskSystemSerial::runAsyncWithDeps(IRunnable* runnable, int num_total_tas
     for (int i = 0; i < num_total_tasks; i++) {
         runnable->runTask(i, num_total_tasks);
     }
-
     return 0;
 }
 
@@ -40,13 +44,14 @@ void TaskSystemSerial::sync() {
     return;
 }
 
+
 /*
  * ================================================================
  * Parallel Task System Implementation
  * ================================================================
  */
 
-const char* TaskSystemParallelSpawn::name() {
+ const char* TaskSystemParallelSpawn::name() {
     return "Parallel + Always Spawn";
 }
 
@@ -78,13 +83,15 @@ void TaskSystemParallelSpawn::sync() {
     return;
 }
 
+
+
 /*
  * ================================================================
  * Parallel Thread Pool Spinning Task System Implementation
  * ================================================================
  */
 
-const char* TaskSystemParallelThreadPoolSpinning::name() {
+ const char* TaskSystemParallelThreadPoolSpinning::name() {
     return "Parallel + Thread Pool + Spin";
 }
 
@@ -116,68 +123,149 @@ void TaskSystemParallelThreadPoolSpinning::sync() {
     return;
 }
 
+
+
+
+
+
+
 /*
  * ================================================================
  * Parallel Thread Pool Sleeping Task System Implementation
  * ================================================================
  */
 
-const char* TaskSystemParallelThreadPoolSleeping::name() {
+const char* TaskSystemParallelThreadPoolSleeping::name() 
+{
     return "Parallel + Thread Pool + Sleep";
 }
 
-TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads) {
-    //
-    // TODO: CS149 student implementations may decide to perform setup
-    // operations (such as thread pool construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
-}
+//constructor
+TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads)
+    : ITaskSystem(num_threads), num_threads(num_threads), stop(false) 
+{
 
-TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
-    //
-    // TODO: CS149 student implementations may decide to perform cleanup
-    // operations (such as thread pool shutdown construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
-}
-
-void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
-
-
-    //
-    // TODO: CS149 students will modify the implementation of this
-    // method in Parts A and B.  The implementation provided below runs all
-    // tasks sequentially on the calling thread.
-    //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+    for (int i = 0; i < num_threads; ++i) 
+    {
+        workers.emplace_back(&TaskSystemParallelThreadPoolSleeping::workerThread, this);
     }
 }
 
-TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
-                                                    const std::vector<TaskID>& deps) {
 
-
-    //
-    // TODO: CS149 students will implement this method in Part B.
-    //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() 
+{
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        stop = true;
     }
+    taskAvailable.notify_all();
 
-    return 0;
+    for (auto& worker : workers) 
+    {
+        worker.join();
+    }
 }
 
-void TaskSystemParallelThreadPoolSleeping::sync() {
 
-    //
-    // TODO: CS149 students will modify the implementation of this method in Part B.
-    //
+void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) 
+{
+    
+    runAsyncWithDeps(runnable, num_total_tasks, {});
+    sync();
 
-    return;
+}
+
+// asynchronous with dependencies
+int TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(
+    IRunnable* runnable, int num_total_tasks, const std::vector<TaskID>& deps) 
+{
+    
+    std::unique_lock<std::mutex> lock(depMutex);
+    int taskID = nextTaskID++;  
+    activeTasks += num_total_tasks;
+
+    if (deps.empty()) 
+    {
+        //no dep so exec immediately
+        for (int i = 0; i < num_total_tasks; ++i) 
+        {
+            {
+                std::lock_guard<std::mutex> qLock(queueMutex);
+                taskQueue.push([runnable, i, num_total_tasks, this]() 
+                {  
+
+                    runnable->runTask(i, num_total_tasks);  
+                
+                    std::unique_lock<std::mutex> depLock(depMutex);
+                    if (--activeTasks == 0) 
+                    {
+                        allTasksCompleted.notify_all();
+                    }
+                });
+            }
+            taskAvailable.notify_one();
+        }
+    } 
+    else 
+    {
+        //dep exists
+        taskDependencies[taskID] = deps.size();
+        dependentTasks[taskID] = {};
+
+        for (int depID : deps) 
+        {
+            dependentTasks[depID].push_back([runnable, num_total_tasks, this, taskID]() 
+            {
+
+                std::unique_lock<std::mutex> depLock(depMutex);
+                
+                if (--taskDependencies[taskID] == 0) 
+                {
+                    for (int i = 0; i < num_total_tasks; ++i) 
+                    {
+                        {
+                            std::lock_guard<std::mutex> qLock(queueMutex);
+                            taskQueue.push([runnable, i, num_total_tasks, this]() 
+                            {
+                                runnable->runTask(i, num_total_tasks);  
+                                         
+                                std::unique_lock<std::mutex> depLock(depMutex);
+                                if (--activeTasks == 0) 
+                                {
+                                    allTasksCompleted.notify_all();
+                                }
+                            });
+                        }
+                        taskAvailable.notify_one();
+                    }
+                }
+            });
+        }
+    }
+    
+    return taskID;
+}
+
+
+void TaskSystemParallelThreadPoolSleeping::sync() 
+{
+    std::unique_lock<std::mutex> lock(depMutex);
+    allTasksCompleted.wait(lock, [this]() { return activeTasks == 0; });
+}
+
+
+void TaskSystemParallelThreadPoolSleeping::workerThread() 
+{
+    while (true) 
+    {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            taskAvailable.wait(lock, [this]() { return !taskQueue.empty() || stop; });
+            if (stop && taskQueue.empty()) return;
+            task = std::move(taskQueue.front());
+            taskQueue.pop();
+        }
+        task();
+    }
 }

@@ -25,7 +25,7 @@ dirs:
 clean:
 	/bin/rm -rf $(OBJDIR) *.ppm *~ $(APP_NAME)
 
-OBJS=$(PPM_OBJ) $(OBJDIR)/tasksys.o
+OBJS=$(PPM_OBJ) $(OBJDIR)/tasksys.o ../tests/main.cpp
 
 $(APP_NAME): clean dirs $(OBJS)
 	$(CXX) ../tests/main.cpp $(CXXFLAGS) -o $@ $(OBJDIR)/tasksys.o -lm -lpthread

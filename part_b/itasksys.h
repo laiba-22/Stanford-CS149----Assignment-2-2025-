@@ -17,6 +17,7 @@ class IRunnable {
            - num_total_tasks: the total number of tasks in the bulk
              task launch.
          */
+        
         virtual void runTask(int task_id, int num_total_tasks) = 0;
 };
 
